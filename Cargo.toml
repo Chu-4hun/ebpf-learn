@@ -1,0 +1,2 @@
+[workspace]
+members = ["xtask", "ebpf-learn", "ebpf-learn-common"]
