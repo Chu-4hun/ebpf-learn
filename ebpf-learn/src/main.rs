@@ -1,12 +1,12 @@
-use std::net::Ipv4Addr;
 
-use anyhow::Context;
-use aya::maps::HashMap;
-use aya::programs::{Lsm, Xdp, XdpFlags};
+use aya::maps::RingBuf;
+use aya::programs::Lsm;
 use aya::{include_bytes_aligned, Bpf, Btf};
 use aya_log::BpfLogger;
 use clap::Parser;
-use log::{debug, info, warn};
+use tracing::{debug, error, info, warn};
+use std::convert::TryFrom;
+use tokio::io::unix::AsyncFd;
 use tokio::signal;
 
 #[derive(Debug, Parser)]
@@ -17,9 +17,17 @@ struct Opt {
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    let opt = Opt::parse();
+    let _opt = Opt::parse();
+    let subscriber = tracing_subscriber::FmtSubscriber::builder()
+        // all spans/events with a level higher than TRACE (e.g, debug, info, warn, etc.)
+        // will be written to stdout.
+        .with_max_level(tracing::Level::TRACE)
+        // builds the subscriber.
+        .finish();
 
-    env_logger::init();
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("setting default subscriber failed");
+
 
     // Bump the memlock rlimit. This is needed for older kernels that don't use the
     // new memcg based accounting, see https://lwn.net/Articles/837122/
@@ -50,17 +58,33 @@ async fn main() -> Result<(), anyhow::Error> {
     }
     let btf = Btf::from_sys_fs()?;
 
-let program: &mut Lsm =
-        bpf.program_mut("file_hook").unwrap().try_into()?;
+    let program: &mut Lsm = bpf.program_mut("file_hook").unwrap().try_into()?;
     program.load("file_open", &btf)?;
     program.attach()?;
-      
-    let mut blocklist: HashMap<_, u32, u32> = HashMap::try_from(bpf.map_mut("BLOCKLIST").unwrap())?;
-    let block_addr: u32 = Ipv4Addr::new(142,250,74,78).try_into()?;
-    blocklist.insert(block_addr, 0, 0)?;
-    
+
+    let ring_buf = RingBuf::try_from(bpf.map_mut("PATHS").unwrap()).unwrap();
+    let mut poll = AsyncFd::new(ring_buf)?;
+    let mut is_looping = true;
+
+    while is_looping {
+        let mut guard: tokio::io::unix::AsyncFdReadyMutGuard<'_, RingBuf<&mut aya::maps::MapData>> =
+            poll.readable_mut().await.unwrap();
+
+        while let Some(item) = guard.get_inner_mut().next() {
+            // item.into_iter().map(|x| );
+            let s = match std::str::from_utf8(&item) {
+                Ok(v) => debug!("Received: {:?}", v.trim_matches(char::from(0))),
+                Err(e) => error!("Invalid UTF-8 sequence: {}", e),
+            };
+
+            
+        }
+        guard.clear_ready();
+    }
     info!("Waiting for Ctrl-C...");
     signal::ctrl_c().await?;
+    is_looping = false;
+
     info!("Exiting...");
 
     Ok(())
